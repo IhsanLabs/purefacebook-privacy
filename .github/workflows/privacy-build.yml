@@ -144,22 +144,42 @@ jobs:
       # -------------------------------------------------------------- build
       - name: Set up JDK
         if: steps.exists.outputs.exists == 'false' || inputs.force
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
+      # The runner image ships the Android SDK; we install only what we need.
+      # (android-actions/setup-android@v3 is broken upstream: it calls
+      #  `sdkmanager tools`, which no longer exists in the SDK repository.)
       - name: Set up Android SDK
-        if: steps.exists.outputs.exists == 'false' || inputs.force
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK platform
         if: steps.exists.outputs.exists == 'false' || inputs.force
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 \
-            || sdkmanager --install "platforms;android-36" >/dev/null
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK" ]; then
+            echo "::error::Android SDK not found at $SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SDKMGR=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)
+          if [ -z "$SDKMGR" ]; then
+            echo "::error::sdkmanager not found under $SDK/cmdline-tools"
+            exit 1
+          fi
+          echo "sdkmanager: $SDKMGR"
+
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          # build-tools version is best-effort; AGP downloads what it needs.
+          "$SDKMGR" --install "platforms;android-36" "build-tools;36.0.0" 2>&1 | tail -n 5 \
+            || "$SDKMGR" --install "platforms;android-36" 2>&1 | tail -n 5
+
+          echo "--- installed platforms ---"
+          ls "$SDK/platforms" || true
+          echo "--- installed build-tools ---"
+          ls "$SDK/build-tools" || true
 
       - name: Build release APK
         if: steps.exists.outputs.exists == 'false' || inputs.force
