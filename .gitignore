@@ -1,0 +1,15 @@
+# secrets / signing
+*.p12
+*.pfx
+*.jks
+*.keystore
+signing/
+keystore-base64.txt
+keystore-password.txt
+key-alias.txt
+*.pem
+
+# local
+.DS_Store
+.idea/
+*.iml

@@ -1,0 +1,275 @@
+name: Privacy build
+
+# Watches the upstream repo for new tags, applies our patch on top of the
+# pristine tag, builds + signs a tracker-free APK, and publishes it here.
+# If the patch does not apply, the job fails and NOTHING is published.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # every day at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (blank = latest)"
+        required: false
+        default: ""
+      build_rev:
+        description: "Build revision for this tag (0 = first build)"
+        required: false
+        default: "0"
+      force:
+        description: "Rebuild even if a release for this tag already exists"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: privacy-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 3elegant/PureFacebook
+  APP_NAME: PureFacebook
+  APP_PACKAGE: io.github.ihsanlabs.purefacebook
+  RAW_BASE: https://raw.githubusercontent.com/IhsanLabs/purefacebook-privacy/main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout recipe repo
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- tag
+      - name: Resolve upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.upstream_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPO}.git" \
+                  | awk -F/ '{print $NF}' \
+                  | grep -E '^[0-9]+(\.[0-9]+)*$' \
+                  | sort -V | tail -n1)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not resolve an upstream tag"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $TAG"
+
+      - name: Clone upstream at that tag
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://github.com/${UPSTREAM_REPO}.git" /tmp/upstream
+          cd /tmp/upstream
+          git checkout --quiet "refs/tags/${{ steps.tag.outputs.tag }}"
+          echo "HEAD: $(git rev-parse --short HEAD)"
+
+      # ------------------------------------------------------------ version
+      - name: Read upstream version
+        id: ver
+        run: |
+          set -euo pipefail
+          VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' /tmp/upstream/app/build.gradle.kts | head -n1)
+          VN=$(grep -oP 'versionName\s*=\s*"\K[^"]+' /tmp/upstream/app/build.gradle.kts | head -n1)
+          REV="${{ inputs.build_rev }}"
+          REV="${REV:-0}"
+          if [ -z "$VC" ] || [ -z "$VN" ]; then
+            echo "::error::Could not parse versionCode/versionName from upstream build.gradle.kts"
+            exit 1
+          fi
+          CODE=$(( VC * 100 + REV ))
+          echo "upstream_code=$VC"    >> "$GITHUB_OUTPUT"
+          echo "upstream_name=$VN"    >> "$GITHUB_OUTPUT"
+          echo "code=$CODE"           >> "$GITHUB_OUTPUT"
+          echo "name=${VN}-privacy"   >> "$GITHUB_OUTPUT"
+          echo "upstream $VN (code $VC) -> ours $VN-privacy (code $CODE)"
+
+      - name: Does this release already exist?
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "v${{ steps.ver.outputs.name }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release v${{ steps.ver.outputs.name }} already exists - skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------------------------------------------------------------- patch
+      - name: Apply privacy patches
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          cd /tmp/upstream
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::No patches found - refusing to publish an unpatched build"
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
+            echo "::group::Applying $(basename "$p")"
+            if ! git apply --3way --verbose "$p"; then
+              echo "::error::Patch failed to apply: $(basename "$p") - upstream changed. Nothing will be published."
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          echo "All patches applied."
+
+      - name: Verify patch actually removed Firebase
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          cd /tmp/upstream
+          if grep -rniE 'firebase|google-services' app/build.gradle.kts build.gradle.kts gradle/libs.versions.toml; then
+            echo "::error::Firebase/Google Services still referenced in Gradle files"
+            exit 1
+          fi
+          if grep -rn 'com.google.firebase' app/src/main/java; then
+            echo "::error::Firebase still referenced in Kotlin sources"
+            exit 1
+          fi
+          echo "Source is clean."
+
+      # -------------------------------------------------------------- build
+      - name: Set up JDK
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 \
+            || sdkmanager --install "platforms;android-36" >/dev/null
+
+      - name: Build release APK
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        working-directory: /tmp/upstream
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease \
+            -PprivacyVersionCode=${{ steps.ver.outputs.code }} \
+            -PprivacyVersionName=${{ steps.ver.outputs.name }}
+
+      - name: Sign APK
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is missing - refusing to publish an unsigned APK"
+            exit 1
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          APK=$(find /tmp/upstream/app/build/outputs/apk/release -name '*.apk' | head -n1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced by the build"
+            exit 1
+          fi
+          echo "Built: $APK"
+
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > /tmp/release.p12
+
+          OUT="/tmp/${APP_NAME}-${{ steps.ver.outputs.name }}.apk"
+          "$BT/zipalign" -p -f 4 "$APK" /tmp/app-aligned.apk
+          "$BT/apksigner" sign \
+            --ks /tmp/release.p12 --ks-type PKCS12 \
+            --ks-pass "pass:${KEYSTORE_PASSWORD}" \
+            --ks-key-alias "${KEY_ALIAS}" \
+            --key-pass "pass:${KEY_PASSWORD}" \
+            --out "$OUT" /tmp/app-aligned.apk
+          "$BT/apksigner" verify --print-certs "$OUT" | head -n 5
+          rm -f /tmp/release.p12
+          echo "SIGNED_APK=$OUT" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------- verify
+      - name: Verify no tracking SDKs in the final APK
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          chmod +x scripts/verify-no-tracking.sh
+          scripts/verify-no-tracking.sh "$SIGNED_APK"
+
+      # ------------------------------------------------------------ publish
+      - name: Checksums
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$SIGNED_APK")"
+          sha256sum "$(basename "$SIGNED_APK")" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.ver.outputs.name }}"
+          gh release create "$TAG" \
+            "$SIGNED_APK" \
+            "$(dirname "$SIGNED_APK")/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PureFacebook ${{ steps.ver.outputs.name }}" \
+            --notes "Tracker-free build of upstream \`${{ steps.tag.outputs.tag }}\`.
+
+          - Firebase Analytics / Installations removed
+          - \`com.google.android.gms.permission.AD_ID\` removed
+          - \`android:allowBackup\` disabled (no cloud backup of session cookies)
+          - app id: \`${APP_PACKAGE}\`
+          - versionCode: \`${{ steps.ver.outputs.code }}\`
+
+          Meta still receives data while you browse, because this is a WebView wrapper around m.facebook.com. See README."
+
+      # ------------------------------------------------------------- config
+      - name: Update update.json
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("update.json")
+          data = json.loads(p.read_text())
+          data["new_version_code"] = int(os.environ["NEW_CODE"])
+          data["new_version_name"] = os.environ["NEW_NAME"]
+          data["update_url"] = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/latest"
+          data["force_update"] = False
+          p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+          PY
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- update.json; then
+            echo "update.json already current"
+            exit 0
+          fi
+          git add update.json
+          git commit -m "chore: update.json -> ${{ steps.ver.outputs.name }} [skip ci]"
+          git push
+        env:
+          NEW_CODE: ${{ steps.ver.outputs.code }}
+          NEW_NAME: ${{ steps.ver.outputs.name }}
